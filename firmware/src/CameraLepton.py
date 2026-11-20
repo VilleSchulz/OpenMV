@@ -1,6 +1,7 @@
 from src.CameraBase import Camera
 import csi
 import time
+import math
 import image
 import ustruct
 import asyncio
@@ -13,7 +14,6 @@ class CameraLepton(Camera):
         self._log_manager = log_manager
 
         self._last_motion_check_time = time.ticks_ms()
-        self._frame_count = 0
 
         # Initialize the FLIR Lepton thermal camera second.
         # Use a soft reset so the already initialized PAG7936 remains active.
@@ -31,17 +31,13 @@ class CameraLepton(Camera):
             self._mot_conf.max_temp_in_celsius()
         )
 
-        # Allow the Lepton to stabilize before capturing the initial
-        # background image used by thermal frame differencing.
+        # Allow the Lepton to stabilize before capturing the first frame.
         self._current_frame = (
             self.csi1.snapshot(time=self.cam_config.lepton_stabilization_ms())
         )
-        self._current_frame_edited = None
 
-        self._extra_fb = image.Image(self.csi1.width(), self.csi1.height(), self.csi1.pixformat())
-        print("About to save background image...")
-        self._extra_fb.draw_image(self.csi1.snapshot())
-        print("Saved background image - Now frame differencing!")
+        # tracks used for vector detection
+        self._tracks = []
 
         self._ffc_active = False
         self._ffc_recovery_until = None
@@ -70,44 +66,106 @@ class CameraLepton(Camera):
         self._write_to_lepton(self._current_frame)
         self.saved_frames += 1
 
-    # Thermal frame differencing.
-    def detect_motion_lepton(self):
-        if self._current_frame:
-            self._current_frame_edited = self._current_frame.copy()
-            if self._current_frame_edited:
-                self._frame_count += 1
-                if self._frame_count > self._mot_conf.bg_update_frames():
-                    self._frame_count = 0
-                    self._current_frame_edited.blend(self._extra_fb, alpha=(self._mot_conf.blend_alpha_max() - self._mot_conf.bg_update_blend()))
-                    self._extra_fb.draw_image(self._current_frame_edited)
-                self._current_frame_edited.difference(self._extra_fb)
-                hist = self._current_frame_edited.get_histogram()
-                diff = (hist.get_percentile(
-                    self._mot_conf.hist_high_percentile()).l_value -
-                        hist.get_percentile(self._mot_conf.hist_low_percentile()).l_value)
-                return diff > self._mot_conf.trigger_threshold()
+    def _detect_motion(self):
+        img = self._current_frame
+        if not img:
             return False
-        return False
+
+        blobs = self._find_blobs(img)
+        self._update_tracks(blobs)
+
+        linear_count = 0
+        for tr in self._tracks:
+            if not self._is_moving(tr):
+                continue
+            if self._is_linear(tr):
+                linear_count += 1
+
+        # enable record when there is linear motion
+        return linear_count > 0
+
+    def _find_blobs(self, img):
+        return img.find_blobs(
+            [(self._mot_conf.blob_threshold_lo(), self._mot_conf.blob_threshold_hi())],
+            pixels_threshold=self._mot_conf.min_blob_pixels(),
+            area_threshold=self._mot_conf.min_blob_area(),
+            merge=True
+        )
+
+    def _dist(self, ax, ay, bx, by):
+        dx = ax - bx
+        dy = ay - by
+        return math.sqrt(dx * dx + dy * dy)
+
+    def _update_tracks(self, blobs):
+        matched = set()
+        new_tracks = []
+
+        for tr in self._tracks:
+            trail = tr.get("trail")
+            if not trail:
+                continue
+
+            lastx, lasty = trail[0]
+            best = None
+            best_d = self._mot_conf.max_match_distance()
+
+            for i, blob in enumerate(blobs):
+                if i in matched:
+                    continue
+
+                d = self._dist(lastx, lasty, blob.cx, blob.cy)
+                if d <= best_d:
+                    best_d = d
+                    best = i
+
+            if best is not None:
+                matched.add(best)
+                trail.insert(0, (blobs[best].cx, blobs[best].cy))
+                del trail[self._mot_conf.trail_length() + 1:]
+                new_tracks.append(tr)
+
+        # Start a track for every blob not assigned to an existing track.
+        for i, blob in enumerate(blobs):
+            if i not in matched:
+                new_tracks.append({
+                    "trail": [(blob.cx, blob.cy)]
+                })
+
+        self._tracks = new_tracks
+
+    def _is_moving(self, tr):
+        if len(tr['trail']) < 2:
+            return False
+        (x0, y0), (x1, y1) = tr['trail'][0], tr['trail'][1]
+        return self._dist(x0, y0, x1, y1) >= self._mot_conf.min_motion_px()
+
+
+    def _is_linear(self, tr):
+        trail = tr['trail']
+        if len(trail) < 3:
+            return False
+        p0 = trail[-1]   # oldest point
+        pn = trail[0]    # newest point
+        dx = pn[0] - p0[0]
+        dy = pn[1] - p0[1]
+        length = math.sqrt(dx * dx + dy * dy)
+        if length == 0 or length < self._mot_conf.min_motion_px():
+            return False
+        max_dev = 0.0
+        for p in trail[1:-1]:
+            # Perpendicular distance from point p to the line p0 -> pn.
+            num = abs(dy * (p[0] - p0[0]) - dx * (p[1] - p0[1]))
+            dev = num / length
+            if dev > max_dev:
+                max_dev = dev
+        return (max_dev / length) <= self._mot_conf.curvature_limit()
+
+    def detect_motion_lepton(self):
+        return self._detect_motion()
 
     async def detect_motion_async_lepton(self):
-        if self._current_frame:
-            self._current_frame_edited = self._current_frame.copy()
-            if self._current_frame_edited:
-                self._frame_count += 1
-                if self._frame_count > self._mot_conf.bg_update_frames():
-                    self._frame_count = 0
-                    self._current_frame_edited.blend(self._extra_fb, alpha=(self._mot_conf.blend_alpha_max() - self._mot_conf.bg_update_blend()))
-                    self._extra_fb.draw_image(self._current_frame_edited)
-                # Compare the current temperature-filtered frame against the
-                # temperature-filtered background frame.
-                self._current_frame_edited.difference(self._extra_fb)
-                hist = self._current_frame_edited.get_histogram()
-                diff = (hist.get_percentile(
-                    self._mot_conf.hist_high_percentile()).l_value -
-                        hist.get_percentile(self._mot_conf.hist_low_percentile()).l_value)
-                return diff > self._mot_conf.trigger_threshold()
-            return False
-        return False
+        return self._detect_motion()
 
     def write_prebuffer_with_catchup_lepton(self):
         last_live_frame_time_lepton = time.ticks_ms()
@@ -198,7 +256,7 @@ class CameraLepton(Camera):
             if self._ffc_active:
                 self._ffc_active = False
                 # Give the thermal image five seconds to stabilize before
-                # allowing frame differencing to resume.
+                # allowing blob detection to resume.
                 self._ffc_recovery_until = time.ticks_add(now, self._ffc_recalibration_time_ms)
                 return True
         # FFC status is polled less frequently than this method is called.
@@ -206,23 +264,17 @@ class CameraLepton(Camera):
         # Lepton state says that FFC is still active.
         if self._ffc_active:
             return True
-        # Keep motion detection disabled during the post-FFC recovery period
+        # Keep motion detection disabled during the post-FFC recovery period.
         if self._ffc_recovery_until is not None:
             if time.ticks_diff(self._ffc_recovery_until, now) > 0:
                 return True
-            # Recovery has finished. The old background frame was captured
-            # before FFC and is no longer a reliable reference. Replace it
-            # with the latest stabilized thermal frame.
-            self._extra_fb.draw_image(self._current_frame)
+            # Recovery has finished; allow blob detection to resume.
             self._ffc_recovery_until = None
-            # Restart the periodic background-update counter because a new
-            # frame-difference reference has just been established.
-            self._frame_count = 0
-            # Skip the current motion check because the current thermal frame
-            # has just been installed as the new frame-difference background.
+            # Skip the current motion check so the first detection after
+            # recovery starts from a stable thermal image.
             return True
         # False means that no FFC or recovery is active and thermal
-        # frame-difference motion detection can safely proceed.
+        # blob detection can safely proceed.
         return False
 
     def prepare_video(self, file_manager):
