@@ -2,6 +2,9 @@
 # calibrate the thermal camera vector detection. In the IDE you can see the
 # detected blob points, vectors and stats on detections.
 
+# NOTE: when running this via the OpenMV IDE delete the main.py from the device
+# and power cycle the device, otherwise the IDE will just freeze or crash
+
 import time
 import csi
 import image
